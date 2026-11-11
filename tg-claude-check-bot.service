@@ -1,0 +1,15 @@
+[Unit]
+Description=Claude IP Subnets HTTP Server & Telegram Bot for Podkop
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=timur
+WorkingDirectory=/home/timur/tg-claude-check-bot
+ExecStart=/usr/bin/env python3 /home/timur/tg-claude-check-bot/app.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

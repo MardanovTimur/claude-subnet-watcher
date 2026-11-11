@@ -1,0 +1,10 @@
+[project]
+name = "tg-claude-check-bot"
+version = "0.1.0"
+description = "Claude IP Subnets Monitor & HTTP Server for OpenWrt Podkop with Telegram Bot notifications"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+claude-ip-bot = "app:main"

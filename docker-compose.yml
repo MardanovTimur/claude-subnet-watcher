@@ -1,0 +1,9 @@
+services:
+  claude-ip-bot:
+    build: .
+    container_name: tg-claude-check-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - /opt/caddy/site/claude:/app/data
