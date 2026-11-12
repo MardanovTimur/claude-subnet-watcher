@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Claude IP Subnets Monitor & HTTP Server for OpenWrt Podkop + Telegram Bot.
+Claude IP Subnets & Domains Monitor + HTTP Server for OpenWrt Podkop + Telegram Bot.
 Zero external dependencies (Python standard library only).
 """
 
@@ -52,6 +52,10 @@ load_dotenv(BASE_DIR / ".env")
 DOCS_MD_URL = os.environ.get(
     "CLAUDE_DOCS_URL", "https://platform.claude.com/docs/en/api/ip-addresses.md"
 )
+DOMAINS_V2FLY_URL = os.environ.get(
+    "CLAUDE_DOMAINS_URL",
+    "https://raw.githubusercontent.com/v2fly/domain-list-community/refs/heads/master/data/anthropic",
+)
 HTTP_HOST = os.environ.get("HTTP_HOST", "0.0.0.0")
 HTTP_PORT = int(os.environ.get("HTTP_PORT", "8080"))
 CHECK_INTERVAL_SEC = int(os.environ.get("CHECK_INTERVAL_SEC", "1800"))  # 30 minutes default
@@ -61,6 +65,9 @@ DATA_DIR = Path(os.environ.get("DATA_DIR", str(BASE_DIR / "data")))
 STATE_FILE = DATA_DIR / "state.json"
 
 CIDR_CANDIDATE_RE = re.compile(r"([0-9a-fA-F:.]+/\d{1,3})")
+DOMAIN_RE = re.compile(
+    r"^(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,63}$"
+)
 
 
 def extract_valid_cidrs(text: str) -> tuple[list[str], list[str]]:
@@ -160,11 +167,57 @@ def parse_claude_ip_markdown(md_text: str) -> dict[str, Any]:
     }
 
 
-def fetch_markdown(url: str = DOCS_MD_URL, timeout: int = 20) -> str:
+def parse_v2fly_domains(raw_text: str) -> dict[str, list[str]]:
+    """
+    Parse v2fly domain-list-community format into clean domain lists for Podkop.
+    Strips inline comments (`# ...`), attributes (`@telemetry`), and prefixes (`full:`, `domain:`).
+    Returns:
+      - domains: all valid domains (including CDN and telemetry)
+      - domains_no_telemetry: valid domains excluding `@telemetry` entries
+    """
+    all_domains: list[str] = []
+    no_telemetry_domains: list[str] = []
+
+    for raw_line in raw_text.splitlines():
+        line = raw_line.split("#", 1)[0].strip()
+        if not line:
+            continue
+
+        tokens = line.split()
+        target = tokens[0]
+        attrs = {t.lstrip("@").lower() for t in tokens[1:] if t.startswith("@")}
+
+        if target.startswith(("include:", "regexp:", "keyword:")):
+            continue
+
+        for prefix in ("full:", "domain:"):
+            if target.startswith(prefix):
+                target = target[len(prefix) :]
+                break
+
+        target = target.strip().lower().rstrip(".")
+        if not DOMAIN_RE.match(target):
+            continue
+
+        if target not in all_domains:
+            all_domains.append(target)
+        if "telemetry" not in attrs and target not in no_telemetry_domains:
+            no_telemetry_domains.append(target)
+
+    if not all_domains:
+        raise ValueError("No valid domains found in v2fly anthropic list")
+
+    return {
+        "domains": all_domains,
+        "domains_no_telemetry": no_telemetry_domains,
+    }
+
+
+def fetch_text(url: str, timeout: int = 20) -> str:
     req = urllib.request.Request(
         url,
         headers={
-            "User-Agent": "claude-podkop-ip-monitor/1.0 (+https://github.com)",
+            "User-Agent": "claude-podkop-ip-monitor/1.0 (+https://github.com/MardanovTimur/claude-subnet-watcher)",
             "Accept": "text/markdown, text/plain, */*",
         },
     )
@@ -173,7 +226,7 @@ def fetch_markdown(url: str = DOCS_MD_URL, timeout: int = 20) -> str:
 
 
 class SubnetStore:
-    """Thread-safe store for parsed subnets and persistence."""
+    """Thread-safe store for parsed subnets, domains, and persistence."""
 
     def __init__(self, data_dir: Path, state_file: Path) -> None:
         self.data_dir = data_dir
@@ -197,6 +250,8 @@ class SubnetStore:
             "collapsed_ipv4": [],
             "ipv6": [],
             "phased_out": [],
+            "domains": [],
+            "domains_no_telemetry": [],
             "updated_at": None,
             "last_checked_at": None,
             "last_error": None,
@@ -211,6 +266,8 @@ class SubnetStore:
             "supernets.txt": data.get("collapsed_ipv4", []),
             "ipv6.txt": data.get("ipv6", []),
             "all-with-ipv6.txt": data.get("all_ipv4", []) + data.get("ipv6", []),
+            "domains.txt": data.get("domains", []),
+            "domains-no-telemetry.txt": data.get("domains_no_telemetry", []),
         }
         for filename, lines in files_map.items():
             path = self.data_dir / filename
@@ -219,13 +276,16 @@ class SubnetStore:
 
     def refresh(self) -> tuple[bool, dict[str, Any], dict[str, dict[str, list[str]]]]:
         """
-        Fetch and parse markdown from Anthropic docs.
+        Fetch and parse markdown from Anthropic docs + domain list from v2fly.
         Returns (changed, current_state, diff_report).
         """
         now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         try:
-            md_text = fetch_markdown()
-            parsed = parse_claude_ip_markdown(md_text)
+            md_text = fetch_text(DOCS_MD_URL)
+            parsed_ips = parse_claude_ip_markdown(md_text)
+            domains_text = fetch_text(DOMAINS_V2FLY_URL)
+            parsed_domains = parse_v2fly_domains(domains_text)
+            parsed = {**parsed_ips, **parsed_domains}
         except Exception as exc:
             with self.lock:
                 self.state["last_checked_at"] = now_iso
@@ -237,16 +297,29 @@ class SubnetStore:
 
         with self.lock:
             is_first_load = self.state.get("updated_at") is None
+            HadNoDomainsBefore = not bool(self.state.get("domains"))
             diff: dict[str, dict[str, list[str]]] = {}
-            tracked_keys = ("inbound_ipv4", "outbound_ipv4", "all_ipv4", "ipv6", "phased_out")
+            tracked_keys = (
+                "inbound_ipv4",
+                "outbound_ipv4",
+                "all_ipv4",
+                "ipv6",
+                "phased_out",
+                "domains",
+            )
             changed = False
 
             for key in tracked_keys:
-                old_set = set(self.state.get(key, []))
-                new_set = set(parsed.get(key, []))
-                added = [x for x in parsed.get(key, []) if x not in old_set]
-                removed = [x for x in self.state.get(key, []) if x not in new_set]
+                old_list = self.state.get(key, [])
+                new_list = parsed.get(key, [])
+                old_set = set(old_list)
+                new_set = set(new_list)
+                added = [x for x in new_list if x not in old_set]
+                removed = [x for x in old_list if x not in new_set]
                 if added or removed:
+                    # Do not trigger a fake diff alert on the very first domain initialization
+                    if key == "domains" and HadNoDomainsBefore:
+                        continue
                     diff[key] = {"added": added, "removed": removed}
                     if key != "phased_out":
                         changed = True
@@ -254,7 +327,7 @@ class SubnetStore:
             self.state.update(parsed)
             self.state["last_checked_at"] = now_iso
             self.state["last_error"] = None
-            if changed or is_first_load:
+            if changed or is_first_load or HadNoDomainsBefore:
                 self.state["updated_at"] = now_iso
 
             self.state_file.write_text(
@@ -305,11 +378,19 @@ class TelegramNotifier:
             logger.error("Failed to send Telegram message: %s", exc)
             return False
 
-    def format_status_message(self, state: dict[str, Any], header: str = "📊 <b>Текущие подсети Claude (Anthropic)</b>") -> str:
+    def format_status_message(
+        self,
+        state: dict[str, Any],
+        header: str = "📊 <b>Текущие подсети и домены Claude (Anthropic)</b>",
+    ) -> str:
         inbound = "\n".join(f"• <code>{c}</code>" for c in state.get("inbound_ipv4", [])) or "—"
         outbound = "\n".join(f"• <code>{c}</code>" for c in state.get("outbound_ipv4", [])) or "—"
         supernets = "\n".join(f"• <code>{c}</code>" for c in state.get("collapsed_ipv4", [])) or "—"
         ipv6 = "\n".join(f"• <code>{c}</code>" for c in state.get("ipv6", [])) or "—"
+        domains = state.get("domains", [])
+        domains_preview = (
+            ", ".join(f"<code>{d}</code>" for d in domains) if domains else "—"
+        )
         updated = state.get("updated_at") or "—"
         checked = state.get("last_checked_at") or "—"
 
@@ -319,20 +400,22 @@ class TelegramNotifier:
             f"<b>Outbound IPv4:</b>\n{outbound}\n\n"
             f"<b>Суперсети IPv4 (collapsed):</b>\n{supernets}\n\n"
             f"<b>IPv6:</b>\n{ipv6}\n\n"
+            f"<b>Домены ({len(domains)} шт.):</b>\n{domains_preview}\n\n"
             f"🕒 Изменено: <code>{updated}</code>\n"
             f"🔄 Проверено: <code>{checked}</code>\n"
-            f"🔗 <a href=\"{DOCS_MD_URL}\">Источник документации</a>"
+            f"🔗 <a href=\"{DOCS_MD_URL}\">IP Docs</a> | <a href=\"{DOMAINS_V2FLY_URL}\">v2fly Domains</a>"
         )
 
     def format_diff_alert(
         self, state: dict[str, Any], diff: dict[str, dict[str, list[str]]]
     ) -> str:
-        lines = ["🚨 <b>Обнаружены изменения IP-подсетей Claude!</b>\n"]
+        lines = ["🚨 <b>Обнаружены изменения в списках Claude!</b>\n"]
         labels = {
             "inbound_ipv4": "Inbound IPv4",
             "outbound_ipv4": "Outbound IPv4",
             "ipv6": "IPv6",
-            "phased_out": "Phased Out (устаревшие)",
+            "domains": "Домены (v2fly)",
+            "phased_out": "Phased Out (устаревшие IP)",
         }
         for key, label in labels.items():
             if key not in diff:
@@ -346,7 +429,9 @@ class TelegramNotifier:
                 lines.append(f"  ➖ <code>{c}</code>")
             lines.append("")
 
-        lines.append(self.format_status_message(state, header="📋 <b>Актуальный список сейчас:</b>"))
+        lines.append(
+            self.format_status_message(state, header="📋 <b>Актуальный список сейчас:</b>")
+        )
         return "\n".join(lines)
 
     def poll_updates_forever(self, stop_event: threading.Event) -> None:
@@ -385,7 +470,6 @@ class TelegramNotifier:
                 time.sleep(5)
 
     def _handle_command(self, chat_id: str, text: str) -> None:
-        # Restrict commands to TG_CHAT_ID if configured
         if self.default_chat_id and chat_id != self.default_chat_id:
             logger.warning("Ignored command from unauthorized chat_id=%s", chat_id)
             return
@@ -393,12 +477,12 @@ class TelegramNotifier:
         cmd = text.split()[0].split("@")[0].lower()
         if cmd in ("/start", "/help"):
             help_msg = (
-                "👋 <b>Бот мониторинга подсетей Claude для Podkop</b>\n\n"
+                "👋 <b>Бот мониторинга подсетей и доменов Claude для Podkop</b>\n\n"
                 f"Ваш <code>TG_CHAT_ID</code>: <code>{chat_id}</code>\n\n"
                 "<b>Доступные команды:</b>\n"
-                "/status — показать текущие подсети в кэше\n"
-                "/check — принудительно запросить документацию Anthropic прямо сейчас\n"
-                "/urls — показать HTTP-эндпоинты для вставки в Podkop"
+                "/status — показать текущие подсети и домены в кэше\n"
+                "/check — принудительно проверить источники прямо сейчас\n"
+                "/urls — показать HTTPS-эндпоинты для вставки в Podkop"
             )
             self.send_message(help_msg, chat_id=chat_id)
         elif cmd == "/status":
@@ -418,13 +502,19 @@ class TelegramNotifier:
                     )
             except Exception as exc:
                 self.send_message(
-                    f"❌ <b>Ошибка при проверке документации:</b>\n<code>{exc}</code>",
+                    f"❌ <b>Ошибка при проверке источников:</b>\n<code>{exc}</code>",
                     chat_id=chat_id,
                 )
         elif cmd == "/urls":
-            base_url = os.environ.get("PUBLIC_BASE_URL", "https://pl.mardanoff.ru/claude").rstrip("/")
+            base_url = os.environ.get(
+                "PUBLIC_BASE_URL", "https://pl.mardanoff.ru/claude"
+            ).rstrip("/")
             urls_msg = (
-                "🌐 <b>HTTPS-эндпоинты для Podkop (Remote Subnet List):</b>\n\n"
+                "🌐 <b>HTTPS-эндпоинты для Podkop:</b>\n\n"
+                "<b>Списки доменов (Remote Domain List):</b>\n"
+                f"• <code>{base_url}/domains.txt</code> — все домены Claude/Anthropic из v2fly (включая CDN и телеметрию)\n"
+                f"• <code>{base_url}/domains-no-telemetry.txt</code> — домены без телеметрии (без sentry/datadog)\n\n"
+                "<b>Списки подсетей (Remote Subnet List):</b>\n"
                 f"• <code>{base_url}/supernets.txt</code> — агрегированные суперсети IPv4 (<b>рекомендуется для Podkop</b>)\n"
                 f"• <code>{base_url}/inbound.txt</code> — только Inbound IPv4 (/23, /22)\n"
                 f"• <code>{base_url}/outbound.txt</code> — Outbound IPv4 (/21, /20)\n"
@@ -449,6 +539,8 @@ def make_http_handler(store: SubnetStore):
                 "/supernets.txt": snap.get("collapsed_ipv4", []),
                 "/ipv6.txt": snap.get("ipv6", []),
                 "/all-with-ipv6.txt": snap.get("all_ipv4", []) + snap.get("ipv6", []),
+                "/domains.txt": snap.get("domains", []),
+                "/domains-no-telemetry.txt": snap.get("domains_no_telemetry", []),
             }
 
             if parsed_path in routes_txt:
@@ -462,7 +554,7 @@ def make_http_handler(store: SubnetStore):
                 self.wfile.write(body)
                 return
 
-            if parsed_path in ("/status.json", "/health"):
+            if parsed_path in ("/status.json", "/state.json", "/health"):
                 body = json.dumps(snap, indent=2, ensure_ascii=False).encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -473,17 +565,21 @@ def make_http_handler(store: SubnetStore):
 
             if parsed_path == "/":
                 index_lines = [
-                    "Claude Podkop Subnet Server",
-                    "===========================",
+                    "Claude Podkop Subnet & Domain Server",
+                    "====================================",
                     "",
-                    "Available endpoints for Podkop:",
-                    "  /inbound.txt       - Inbound IPv4 subnets (160.79.104.0/23, 153.61.224.0/22)",
-                    "  /outbound.txt      - Outbound IPv4 subnets (160.79.104.0/21, 153.61.208.0/20)",
-                    "  /all.txt           - All active IPv4 subnets (Inbound + Outbound)",
-                    "  /supernets.txt     - Collapsed minimal IPv4 supernets (recommended)",
-                    "  /ipv6.txt          - Active IPv6 subnets (2607:6bc0::/48)",
-                    "  /all-with-ipv6.txt - All active IPv4 + IPv6 subnets",
-                    "  /status.json       - Full JSON state & metadata",
+                    "Domain lists for Podkop:",
+                    "  /domains.txt              - All active domains (from v2fly/domain-list-community)",
+                    "  /domains-no-telemetry.txt - Active domains excluding @telemetry",
+                    "",
+                    "Subnet lists for Podkop:",
+                    "  /supernets.txt            - Collapsed minimal IPv4 supernets (recommended)",
+                    "  /inbound.txt              - Inbound IPv4 subnets (160.79.104.0/23, 153.61.224.0/22)",
+                    "  /outbound.txt             - Outbound IPv4 subnets (160.79.104.0/21, 153.61.208.0/20)",
+                    "  /all.txt                  - All active IPv4 subnets (Inbound + Outbound)",
+                    "  /ipv6.txt                 - Active IPv6 subnets (2607:6bc0::/48)",
+                    "  /all-with-ipv6.txt        - All active IPv4 + IPv6 subnets",
+                    "  /state.json               - Full JSON state & metadata",
                     "",
                     f"Last updated: {snap.get('updated_at')}",
                     f"Last checked: {snap.get('last_checked_at')}",
@@ -533,10 +629,11 @@ def main() -> None:
     try:
         changed, snap, diff = store.refresh()
         logger.info(
-            "Initial sync complete: inbound=%s, outbound=%s, ipv6=%s",
+            "Initial sync complete: inbound=%s, outbound=%s, ipv6=%s, domains=%d",
             snap["inbound_ipv4"],
             snap["outbound_ipv4"],
             snap["ipv6"],
+            len(snap.get("domains", [])),
         )
         if changed:
             notifier.send_message(notifier.format_diff_alert(snap, diff))
